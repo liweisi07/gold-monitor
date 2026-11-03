@@ -9,6 +9,8 @@
  * 4. 把下面代码粘进「代码」编辑器 → 保存并部署
  *
  * 数据源：gold-api.com（主）/ goldprice.dev（备），汇率：open.er-api.com
+ * 国内金价：上金所 Au99.99（主，sge.com.cn/graph/quotations）/ 新浪沪金连续（备）
+ * 国内金价只做展示与走势记录，不参与 Telegram 报警（报警线仍只针对国际现货 USD/oz）
  *
  * Telegram 推送（可选）：
  * 1. Telegram 里找 @BotFather → /newbot 建机器人，拿到 token
@@ -23,6 +25,80 @@
 
 const GOLD_API = "https://api.gold-api.com/price/XAU";
 const GOLD_API_FB = "https://api.goldprice.dev/v1/prices?symbol=XAU-USD-SPOT";
+const SGE_API = "https://www.sge.com.cn/graph/quotations";
+const SINA_AU_API = "https://hq.sinajs.cn/list=nf_AU0";
+
+// 上金所 Au99.99 现货（元/克）：GET ?instid=Au99.99 返回当日交易周期序列
+// 数组按周期顺序排列：夜盘 20:00→02:30 在前，日盘 09:00→15:30 在后；
+// 未开盘的时段会预填平值占位（如日盘未开时整段 833.0），不能直接取最后一个数，
+// 必须按 delaystr 的更新时间截断到已交易的时点再取最后一个有效价
+function sgeLatest(j) {
+  const times = Array.isArray(j.times) ? j.times : [];
+  const data = Array.isArray(j.data) ? j.data : [];
+  const n = Math.min(times.length, data.length);
+  if (!n) return null;
+  let cap = n - 1;
+  const tm = typeof j.delaystr === "string" && j.delaystr.match(/(\d{1,2}):(\d{2})/);
+  if (tm) {
+    const mins = parseInt(tm[1], 10) * 60 + parseInt(tm[2], 10);
+    let dayStart = times.indexOf("09:00");
+    if (dayStart < 0) dayStart = n;
+    let pos;
+    if (mins >= 20 * 60) pos = mins - 20 * 60;              // 夜盘上半段
+    else if (mins <= 2 * 60 + 30) pos = 240 + mins;         // 夜盘下半段
+    else if (mins >= 9 * 60 && mins <= 15 * 60 + 30) pos = dayStart + (mins - 9 * 60); // 日盘
+    else if (mins < 9 * 60) pos = dayStart - 1;             // 夜盘后、日盘前：取夜盘收尾
+    else pos = n - 1;                                      // 日盘后：取全部
+    cap = Math.min(Math.max(pos, 0), n - 1);
+  }
+  for (let i = cap; i >= 0; i--) {
+    const v = parseFloat(data[i]);
+    if (v > 0) return v;
+  }
+  return null;
+}
+
+async function fetchSge() {
+  try {
+    const r = await fetch(SGE_API + "?instid=Au99.99", {
+      headers: {
+        "Referer": "https://www.sge.com.cn/",
+        "X-Requested-With": "XMLHttpRequest",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+      }
+    });
+    if (!r.ok) return null;
+    const j = await r.json();
+    const price = sgeLatest(j);
+    if (!price) return null;
+    return { price, src: "sge.com.cn", at: j.delaystr || "" };
+  } catch (e) { return null; }
+}
+
+// 兜底：新浪沪金连续（上期所黄金期货连续合约，元/克）；注意这不是上金所现货，来源会如实标注
+async function fetchSinaAu() {
+  try {
+    const r = await fetch(SINA_AU_API, { headers: { Referer: "https://finance.sina.com.cn" } });
+    if (!r.ok) return null;
+    const buf = await r.arrayBuffer();
+    let text;
+    try { text = new TextDecoder("gbk").decode(buf); }
+    catch (e) { text = new TextDecoder().decode(buf); }
+    const m = text.match(/hq_str_nf_AU0="([^"]*)"/);
+    if (!m) return null;
+    const f = m[1].split(",");
+    const price = parseFloat(f[8]); // 最新价
+    if (!(price > 0)) return null;
+    // 佐证：最新价应在当日最高/最低之间，且在买价/卖价附近，否则视为字段错位
+    const hi = parseFloat(f[3]), lo = parseFloat(f[4]);
+    if (hi > 0 && lo > 0 && (price > hi || price < lo)) return null;
+    return { price, src: "新浪·沪金连续", at: "" };
+  } catch (e) { return null; }
+}
+
+async function fetchDomestic() {
+  return (await fetchSge()) || (await fetchSinaAu());
+}
 const FX_API = "https://open.er-api.com/v6/latest/USD";
 const OZ_TO_G = 31.1034768;
 const MAX_POINTS = 2880; // 30分钟一次 ≈ 存60天
@@ -103,6 +179,15 @@ async function handleScheduled(env) {
   await env.GOLD_KV.put("history", JSON.stringify(hist));
   await fetchFX(env); // 顺手刷新汇率
   await checkTelegramAlert(env, g.price);
+  // 国内金价（失败则保留旧数据，不清掉）
+  const d = await fetchDomestic();
+  if (d) {
+    await env.GOLD_KV.put("cn_latest", JSON.stringify({ ...d, fetchedAt: now }));
+    let cnHist = (await env.GOLD_KV.get("cn_history", "json")) || [];
+    cnHist.push({ t: now, p: Math.round(d.price * 100) / 100 });
+    if (cnHist.length > MAX_POINTS) cnHist = cnHist.slice(-MAX_POINTS);
+    await env.GOLD_KV.put("cn_history", JSON.stringify(cnHist));
+  }
 }
 
 function json(data, status = 200) {
@@ -118,11 +203,21 @@ async function handleApi(url, env) {
     const fx = await fetchFX(env);
     if (!latest) return json({ ok: false, msg: "暂无数据，等第一次定时抓取" });
     const cnyPerG = (latest.price / OZ_TO_G) * fx;
+    const cn = (await env.GOLD_KV.get("cn_latest", "json")) || null;
     return json({ ok: true, usd: latest.price, cnyPerG: Math.round(cnyPerG * 100) / 100,
-      fx, src: latest.src, at: latest.fetchedAt });
+      fx, src: latest.src, at: latest.fetchedAt,
+      cn: cn ? { price: cn.price, src: cn.src, at: cn.at || "", fetchedAt: cn.fetchedAt } : null });
   }
   if (path === "/api/history") {
     const hist = (await env.GOLD_KV.get("history", "json")) || [];
+    const range = url.searchParams.get("range") || "all";
+    const now = Date.now();
+    const ms = { "24h": 864e5, "7d": 7 * 864e5, "30d": 30 * 864e5 }[range];
+    const data = ms ? hist.filter(p => now - p.t <= ms) : hist;
+    return json({ ok: true, count: data.length, data });
+  }
+  if (path === "/api/cn_history") {
+    const hist = (await env.GOLD_KV.get("cn_history", "json")) || [];
     const range = url.searchParams.get("range") || "all";
     const now = Date.now();
     const ms = { "24h": 864e5, "7d": 7 * 864e5, "30d": 30 * 864e5 }[range];
@@ -142,7 +237,7 @@ body{background:#0b0e17;color:#e8edf7;font-family:-apple-system,"PingFang SC","M
 .wrap{max-width:860px;margin:0 auto;padding:28px 18px 60px}
 h1{font-size:22px;font-weight:800;margin-bottom:4px}
 .sub{color:#8b93b0;font-size:13px;margin-bottom:22px}
-.cards{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:18px}
+.cards{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px;margin-bottom:18px}
 .card{background:#12162a;border:1px solid #262a3d;border-radius:14px;padding:18px}
 .card .k{font-size:12px;color:#8b93b0;margin-bottom:8px}
 .card .v{font-size:30px;font-weight:800;font-variant-numeric:tabular-nums}
@@ -166,14 +261,18 @@ h1{font-size:22px;font-weight:800;margin-bottom:4px}
 @media(max-width:560px){.cards{grid-template-columns:1fr}.card .v{font-size:26px}}
 </style></head>
 <body><div class="wrap">
-<h1>金价监听站 <span style="font-size:13px;color:#8b93b0;font-weight:400">XAU/USD 现货</span></h1>
+<h1>金价监听站 <span style="font-size:13px;color:#8b93b0;font-weight:400">国际现货 · 国内金价</span></h1>
 <p class="sub" id="upd">加载中…</p>
 <div class="banner" id="banner"></div>
 <div class="cards">
   <div class="card"><div class="k">国际现货金价</div><div class="v"><span id="pUsd">—</span> <small>USD/oz</small></div><div class="k" id="pChg" style="margin:8px 0 0"></div></div>
   <div class="card"><div class="k">人民币计价</div><div class="v"><span id="pCny">—</span> <small>元/克</small></div><div class="k" style="margin:8px 0 0" id="pFx"></div></div>
+  <div class="card"><div class="k">国内金价 Au99.99</div><div class="v"><span id="pCn">—</span> <small>元/克</small></div><div class="k" id="cnChg" style="margin:8px 0 0"></div><div class="k" id="cnSrc" style="margin:4px 0 0"></div></div>
 </div>
 <div class="chart-box">
+  <div class="ranges">
+    <button data-s="xau" class="on">国际现货</button><button data-s="cn">国内金价</button>
+  </div>
   <div class="ranges">
     <button data-r="24h" class="on">24小时</button><button data-r="7d">7天</button><button data-r="30d">30天</button><button data-r="all">全部</button>
   </div>
@@ -186,11 +285,11 @@ h1{font-size:22px;font-weight:800;margin-bottom:4px}
   <p class="note" id="aStatus">未设置</p>
   <p class="note">要手机推送？在 Worker 的「设置 → 变量」里配好 TG_BOT_TOKEN、TG_CHAT_ID 和 ALERT_HIGH / ALERT_LOW，价格穿越报警线时机器人会自动发 Telegram 消息（代码头部有详细步骤）。</p>
 </div>
-<p class="foot">数据每30分钟自动抓取 · 源 gold-api.com · 仅供参考，不构成投资建议</p>
+<p class="foot">数据每30分钟自动抓取 · 国际源 gold-api.com · 国内源 上金所 Au99.99（新浪沪金连续兜底）· 仅供参考，不构成投资建议</p>
 </div>
 <script>
 const $=id=>document.getElementById(id);
-let range='24h', lastUsd=null;
+let range='24h', series='xau', lastUsd=null;
 async function load(){
   try{
     const r=await fetch('/api/latest'); const j=await r.json();
@@ -200,11 +299,20 @@ async function load(){
     $('pCny').textContent=j.cnyPerG.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
     $('pFx').textContent='美元兑人民币 '+j.fx;
     $('upd').textContent='更新于 '+new Date(j.at).toLocaleString('zh-CN')+' · 来源 '+j.src;
+    if(j.cn){
+      $('pCn').textContent=j.cn.price.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
+      const diff=j.cn.price-j.cnyPerG;
+      $('cnSrc').textContent='来源 '+j.cn.src+(j.cn.at?(' · 上金所更新 '+j.cn.at):'')+' · 较国际换算价 '+(diff>=0?'+':'')+diff.toFixed(2)+' 元/克';
+    }else{
+      $('pCn').textContent='—';
+      $('cnSrc').textContent='暂无数据，等第一次定时抓取';
+    }
     drawChart(); checkAlert();
   }catch(e){$('upd').textContent='加载失败，稍后重试';}
 }
 async function drawChart(){
-  const r=await fetch('/api/history?range='+range); const j=await r.json();
+  const ep=series==='cn'?'/api/cn_history?range='+range:'/api/history?range='+range;
+  const r=await fetch(ep); const j=await r.json();
   const d=j.data||[]; const cv=$('chart'), ctx=cv.getContext('2d');
   const W=cv.clientWidth,H=cv.clientHeight,dpr=devicePixelRatio||1;
   cv.width=W*dpr;cv.height=H*dpr;ctx.scale(dpr,dpr);
@@ -232,10 +340,11 @@ async function drawChart(){
   ctx.fillText(new Date(t0).toLocaleString('zh-CN',{month:'numeric',day:'numeric',hour:'numeric',minute:'2-digit'}),8,H-8);
   const e=new Date(t1).toLocaleString('zh-CN',{month:'numeric',day:'numeric',hour:'numeric',minute:'2-digit'});
   ctx.fillText(e,W-8-ctx.measureText(e).width,H-8);
-  // 24h涨跌
+  // 24h涨跌（写到当前系列对应的卡片上）
   const dayAgo=Date.now()-864e5; const old=d.find(p=>p.t>=dayAgo);
-  if(old){const chg=ps[ps.length-1]-old.p,pct=chg/old.p*100;
-    $('pChg').innerHTML='<span class="'+(chg>=0?'up':'down')+'">'+(chg>=0?'▲ +':'▼ ')+chg.toFixed(2)+' ('+pct.toFixed(2)+'%)</span> 24h';}
+  const chgEl=$(series==='cn'?'cnChg':'pChg');
+  if(old&&chgEl){const chg=ps[ps.length-1]-old.p,pct=chg/old.p*100;
+    chgEl.innerHTML='<span class="'+(chg>=0?'up':'down')+'">'+(chg>=0?'▲ +':'▼ ')+chg.toFixed(2)+' ('+pct.toFixed(2)+'%)</span> 24h';}
 }
 function checkAlert(){
   const h=parseFloat(localStorage.getItem('gAlertH')), l=parseFloat(localStorage.getItem('gAlertL'));
@@ -249,9 +358,12 @@ function refreshAStatus(){
   $('aStatus').textContent=(h||l)?('已设置：'+(h?('高于 '+h):'')+(h&&l?'，':'')+(l?('低于 '+l):'')):'未设置';
   if(h)$('aHigh').value=h; if(l)$('aLow').value=l;
 }
-document.querySelectorAll('.ranges button').forEach(b=>b.onclick=()=>{
-  document.querySelectorAll('.ranges button').forEach(x=>x.classList.remove('on'));
+document.querySelectorAll('[data-r]').forEach(b=>b.onclick=()=>{
+  document.querySelectorAll('[data-r]').forEach(x=>x.classList.remove('on'));
   b.classList.add('on');range=b.dataset.r;drawChart();});
+document.querySelectorAll('[data-s]').forEach(b=>b.onclick=()=>{
+  document.querySelectorAll('[data-s]').forEach(x=>x.classList.remove('on'));
+  b.classList.add('on');series=b.dataset.s;drawChart();});
 $('aSave').onclick=()=>{const h=$('aHigh').value,l=$('aLow').value;
   h?localStorage.setItem('gAlertH',h):localStorage.removeItem('gAlertH');
   l?localStorage.setItem('gAlertL',l):localStorage.removeItem('gAlertL');
